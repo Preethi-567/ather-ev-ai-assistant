@@ -1,0 +1,68 @@
+# ----------------------
+# 🔐 ENV / SECRETS
+# ----------------------
+.env
+*.env
+
+# ----------------------
+# 🐍 PYTHON
+# ----------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# ----------------------
+# 🧪 VIRTUAL ENV
+# ----------------------
+.venv/
+venv/
+env/
+
+# ----------------------
+# 📦 DATA FILES (LARGE / GENERATED)
+# ----------------------
+data/chunks/
+data/extracted/
+data/*.pkl
+data/*.json
+
+# If you want to keep sample JSON, comment above and add specific allow rules
+
+# ----------------------
+# 🧠 VECTOR DB (IMPORTANT)
+# ----------------------
+chroma_db/
+*.bin
+
+# ----------------------
+# 📊 LOGS
+# ----------------------
+logs/
+*.log
+
+# ----------------------
+# 🧪 TEST OUTPUTS
+# ----------------------
+test_set.json
+
+# ----------------------
+# 💻 OS FILES
+# ----------------------
+.DS_Store
+Thumbs.db
+
+# ----------------------
+# 🧰 IDE
+# ----------------------
+.vscode/
+.idea/
+
+# ----------------------
+# 📄 OPTIONAL: PDFs (decide based on repo size)
+# ----------------------
+# If PDFs are large, ignore them:
+# data/manuals/
+
+# OR keep them if important for demo

@@ -1,0 +1,48 @@
+# requirements.txt
+
+# ── Core AI / LLM ──────────────────────────────────────────
+google-genai       # Gemini Flash — extraction + generation + intent
+
+# ── Embeddings ─────────────────────────────────────────────
+sentence-transformers>=2.7.0      # BGE embeddings + cross-encoder reranker
+torch>=2.0.0                      # Required by sentence-transformers
+
+# ── Vector Database ────────────────────────────────────────
+chromadb>=0.5.0                   # Local persistent vector store
+
+# ── BM25 Keyword Search ────────────────────────────────────
+rank-bm25>=0.2.2                  # BM25 over raw text chunks
+
+# ── PDF Processing ─────────────────────────────────────────
+PyMuPDF>=1.24.0                   # fitz — convert PDF pages → images
+
+# ── API Backend ────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0                   # Request/response validation
+
+# ── Frontend ───────────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── Voice ──────────────────────────────────────────────────
+openai-whisper>=20231117          # Local Whisper STT (no API key needed)
+pyttsx3>=2.90                     # Local TTS
+sounddevice>=0.4.6                # Microphone recording
+scipy>=1.13.0                     # Save audio as WAV for Whisper
+
+# ── Evaluation ─────────────────────────────────────────────
+ragas>=0.1.9                      # RAGAS faithfulness / relevancy metrics
+datasets>=2.19.0                  # Required by RAGAS
+
+# ── Orchestration ──────────────────────────────────────────
+langgraph>=0.1.0                  # LangGraph state machine (query flow)
+langchain-core>=0.2.0             # LangGraph dependency
+
+# ── Logging ────────────────────────────────────────────────
+loguru>=0.7.2
+
+# ── Utilities ──────────────────────────────────────────────
+python-dotenv>=1.0.0              # Load .env variables
+pillow>=10.3.0                    # Image handling (PDF page images)
+numpy>=1.26.0
+tqdm>=4.66.0                      # Progress bars during ingestion
