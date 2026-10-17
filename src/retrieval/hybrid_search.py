@@ -9,11 +9,14 @@ V2 upgrades:
   - Confidence score exposed for prompt_chain's threshold check
 """
 
+from typing import Sequence
+
 from loguru import logger
 from sentence_transformers import CrossEncoder
 
 from src.retrieval.dense_search import dense_search
 from src.retrieval.bm25_search  import bm25_search
+from src.retrieval.group_merge  import merge_group_results
 
 # ── Constants ────────────────────────────────────────────────────────────────
 RERANKER_MODEL   = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -26,6 +29,14 @@ FINAL_TOP_K      = 5        # results after reranking
 #   0 to 3 = moderate confidence
 #   < 0    = poor match (chunks probably not relevant)
 CONFIDENCE_FLOOR = 0.0      # below this → prepend uncertainty warning
+
+# ── Multi-scope retrieval (several scooters / both series) ───────────────────
+# Same logit scale as CONFIDENCE_FLOOR. Non-best groups must clear this to
+# contribute chunks (see group_merge.py). When P3 moves to sigmoid scores,
+# re-base this together with CONFIDENCE_FLOOR.
+GROUP_MIN_RERANK    = 0.0
+MAX_CONTEXT_CHUNKS  = 6     # total chunks sent to the generator across groups
+MIN_PER_GROUP       = 2
 
 
 class HybridSearcher:
@@ -123,15 +134,15 @@ class HybridSearcher:
     def search(
         self,
         query: str,
-        vehicle_model: str | None = None,
+        vehicle_models: Sequence[str] | None = None,
         content_type_filter: str | None = None
     ) -> dict:
         """
-        Full hybrid search pipeline.
+        Full hybrid search pipeline for ONE scope.
 
         Args:
             query:               User query (already rewritten by QueryRewriter)
-            vehicle_model:       Metadata filter
+            vehicle_models:      Restrict to these model tags (None = no restriction)
             content_type_filter: Optional — 'warning'|'procedure'|'specification'
 
         Returns:
@@ -146,12 +157,12 @@ class HybridSearcher:
         # ── Step 1: Parallel retrieval ────────────────────────────────────────
         dense_results = dense_search(
             query, top_k=DENSE_TOP_K,
-            vehicle_model=vehicle_model,
+            vehicle_models=vehicle_models,
             content_type_filter=content_type_filter
         )
         bm25_results = bm25_search(
             query, top_k=BM25_TOP_K,
-            vehicle_model=vehicle_model
+            vehicle_models=vehicle_models
         )
 
         logger.debug(
@@ -207,6 +218,59 @@ class HybridSearcher:
         }
 
 
+    def search_grouped(
+        self,
+        query: str,
+        groups: Sequence[Sequence[str]],
+        content_type_filter: str | None = None
+    ) -> dict:
+        """
+        One hybrid search per scope group, merged into a single context set.
+
+        groups:
+            []                     → unrestricted search
+            [[450S]]               → plain single-scope search (5 chunks)
+            [[450X],[Rizta Z]]     → one search per group, merged (see group_merge)
+            [[450X,450S],[Rizta…]] → the "no model named" series fallback
+
+        COST: n_groups × (embed + dense + BM25 + rerank). With the series
+        fallback that is 2×; measure against the 3 s target in the eval run.
+        An obvious optimisation (embed the query once and pass it down) is left
+        out on purpose — correctness first, then profile.
+        """
+        if not groups:
+            return self.search(query, None, content_type_filter)
+
+        if len(groups) == 1:
+            res = self.search(query, list(groups[0]), content_type_filter)
+            res["groups_searched"] = 1
+            return res
+
+        per_group = max(MIN_PER_GROUP, MAX_CONTEXT_CHUNKS // len(groups))
+        per_group_results = [
+            self.search(query, list(g), content_type_filter) for g in groups
+        ]
+
+        merged = merge_group_results(
+            per_group_results, per_group=per_group, min_score=GROUP_MIN_RERANK
+        )
+
+        top_score = merged["top_score"]
+        low_conf  = (not merged["chunks"]) or top_score < CONFIDENCE_FLOOR
+
+        logger.info(
+            f"Grouped search: {len(groups)} groups → {len(merged['chunks'])} chunks "
+            f"(best group #{merged['best_group']}, top score {top_score:.3f})"
+        )
+
+        return {
+            "chunks":          merged["chunks"],
+            "top_score":       round(top_score, 4),
+            "low_confidence":  low_conf,
+            "groups_searched": len(groups),
+        }
+
+
 # ── Module-level singleton ────────────────────────────────────────────────────
 _searcher: HybridSearcher | None = None
 
@@ -219,11 +283,20 @@ def get_hybrid_searcher() -> HybridSearcher:
 
 def hybrid_search(
     query: str,
-    vehicle_model: str | None = None,
+    vehicle_models: Sequence[str] | None = None,
     content_type_filter: str | None = None
 ) -> dict:
-    """Convenience function — uses module-level singleton."""
-    return get_hybrid_searcher().search(query, vehicle_model, content_type_filter)
+    """Convenience function — single scope, uses module-level singleton."""
+    return get_hybrid_searcher().search(query, vehicle_models, content_type_filter)
+
+
+def hybrid_search_grouped(
+    query: str,
+    groups: Sequence[Sequence[str]],
+    content_type_filter: str | None = None
+) -> dict:
+    """Convenience function — one search per scope group, merged."""
+    return get_hybrid_searcher().search_grouped(query, groups, content_type_filter)
 
 
 # ── Quick test ───────────────────────────────────────────────────────────────

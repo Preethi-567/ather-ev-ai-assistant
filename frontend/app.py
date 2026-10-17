@@ -156,6 +156,11 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+def _format_sources(sources: list[dict]) -> str:
+    """[{"model": "Ather 450S", "page": 20}, ...] → "Ather 450S p.20, Ather Rizta S p.18"."""
+    return ", ".join(f"{s['model']} p.{s['page']}" for s in sources)
+
+
 # --- SESSION STATE ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -179,8 +184,13 @@ if menu == "Chat Assistant":
     for i, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if msg.get("pages"):
-                st.markdown(f"<span class='source-tag'>Cited Pages: {', '.join(map(str, msg['pages']))}</span>", unsafe_allow_html=True)
+            if msg.get("sources"):
+                st.markdown(
+                    f"<span class='source-tag'>Sources: {_format_sources(msg['sources'])}</span>",
+                    unsafe_allow_html=True,
+                )
+            if msg.get("support_contact"):
+                st.caption(f"Ather Support: {msg['support_contact']}")
 
     # Input Area
     if prompt := st.chat_input("Ask about Warp mode, charging, or troubleshooting..."):
@@ -194,9 +204,17 @@ if menu == "Chat Assistant":
         with st.chat_message("assistant"):
             st.markdown(result["answer"])
             
-            # Show Cited Pages as pill-shaped tags
-            if result.get("cited_pages"):
-                st.markdown(f"<span class='source-tag'>Sources: {', '.join(map(str, result['cited_pages']))}</span>", unsafe_allow_html=True)
+            # Show verified sources (model + page) as a pill-shaped tag
+            if result.get("sources"):
+                st.markdown(
+                    f"<span class='source-tag'>Sources: {_format_sources(result['sources'])}</span>",
+                    unsafe_allow_html=True,
+                )
+
+            # Phone number only when the manual for every scooter in the answer
+            # prints one (API returns null otherwise — never guessed here).
+            if result.get("support_contact"):
+                st.caption(f"Ather Support: {result['support_contact']}")
 
             # Feedback Row
             f_col1, f_col2, _ = st.columns([0.05, 0.05, 0.9])
@@ -212,7 +230,8 @@ if menu == "Chat Assistant":
         st.session_state.messages.append({
             "role": "assistant", 
             "content": result["answer"],
-            "pages": result.get("cited_pages", [])
+            "sources": result.get("sources", []),
+            "support_contact": result.get("support_contact"),
         })
 
 else:

@@ -11,7 +11,7 @@ V2 upgrades:
 
 import os
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Sequence
 from loguru import logger
 from dotenv import load_dotenv
 
@@ -29,6 +29,24 @@ DEFAULT_TOP_K   = 10
 
 # BGE asymmetric retrieval: queries need this prefix, documents do NOT
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
+
+def _normalise_models(
+    vehicle_models: Optional[Sequence[str] | str]
+) -> List[str]:
+    """None / "" / [] → [] (no restriction). A bare str → [str]."""
+    if not vehicle_models:
+        return []
+    if isinstance(vehicle_models, str):
+        return [vehicle_models]
+    return [m for m in vehicle_models if m]
+
+
+def _model_where(models: List[str]) -> Dict[str, Any]:
+    """One model → $eq (works on every Chroma version); several → $in."""
+    if len(models) == 1:
+        return {"vehicle_model": {"$eq": models[0]}}
+    return {"vehicle_model": {"$in": list(models)}}
 
 
 class DenseSearcher:
@@ -67,17 +85,24 @@ class DenseSearcher:
         self,
         query: str,
         top_k: int = DEFAULT_TOP_K,
-        vehicle_model: Optional[str] = None,
+        vehicle_models: Optional[Sequence[str]] = None,
         content_type_filter: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Run dense semantic search against ChromaDB with Pylance-safe typing."""
+        """
+        Run dense semantic search against ChromaDB.
 
+        vehicle_models: restrict results to these `vehicle_model` tags.
+                        None → no model restriction. A bare str is accepted for
+                        backwards compatibility and treated as a one-item list.
+        """
+
+        models = _normalise_models(vehicle_models)
         query_embedding = self._embed_query(query)
 
         # ── Build where filter ────────────────────────────────────────────────
         where_conditions = []
-        if vehicle_model:
-            where_conditions.append({"vehicle_model": {"$eq": vehicle_model}})
+        if models:
+            where_conditions.append(_model_where(models))
         if content_type_filter:
             where_conditions.append({"content_type": {"$eq": content_type_filter}})
 
@@ -97,10 +122,17 @@ class DenseSearcher:
             )
 
         except Exception as e:
-            logger.warning(f"ChromaDB query failed — retrying without filter: {e}")
+            # The old code retried unfiltered and kept the results. With model
+            # scoping that would silently leak another scooter's chunks into the
+            # answer. Retry unfiltered ONLY to recover candidates, then re-apply
+            # the model restriction in Python below.
+            logger.warning(
+                f"ChromaDB filtered query failed — retrying unfiltered, "
+                f"model filter re-applied in Python: {e}"
+            )
             results = self.collection.query(
                 query_embeddings=[query_embedding],
-                n_results=top_k,
+                n_results=max(top_k * 3, top_k),
                 include=["documents", "metadatas", "distances"]
             )
 
@@ -134,6 +166,11 @@ class DenseSearcher:
             keywords = [kw for kw in str(raw_keywords or "").split("|") if kw]
             component_names = [cn for cn in str(raw_components or "").split("|") if cn]
 
+            # Guarantee: nothing outside the requested models gets through,
+            # whether or not the DB-side filter was applied.
+            if models and meta.get("vehicle_model") not in models:
+                continue
+
             formatted.append({
                 "chunk_id": chunk_id,
                 "text": doc_text,
@@ -144,6 +181,8 @@ class DenseSearcher:
                 "keywords": keywords,
                 "component_names": component_names,
             })
+
+        formatted = formatted[:top_k]
 
         logger.debug(f"Dense: {len(formatted)} results (top={formatted[0]['score'] if formatted else 0:.3f})")
         return formatted
@@ -162,11 +201,11 @@ def get_dense_searcher() -> DenseSearcher:
 def dense_search(
     query: str,
     top_k: int = DEFAULT_TOP_K,
-    vehicle_model: Optional[str] = None,
+    vehicle_models: Optional[Sequence[str]] = None,
     content_type_filter: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     return get_dense_searcher().search(
-        query, top_k, vehicle_model, content_type_filter
+        query, top_k, vehicle_models, content_type_filter
     )
 
 

@@ -12,6 +12,7 @@ V2 upgrades:
 import pickle
 import re
 from pathlib import Path
+from typing import Sequence
 from loguru import logger
 from rank_bm25 import BM25Okapi
 
@@ -92,7 +93,7 @@ class BM25Searcher:
         self,
         query: str,
         top_k: int = 10,
-        vehicle_model: str | None = None
+        vehicle_models: "Sequence[str] | str | None" = None
     ) -> list[dict]:
         """
         Run BM25 keyword search.
@@ -105,11 +106,19 @@ class BM25Searcher:
         Args:
             query:         User query string
             top_k:         Number of results to return
-            vehicle_model: Used for post-filter (BM25 has no metadata filter)
+            vehicle_models: Restrict to these `vehicle_model` tags. BM25 has no
+                            metadata filter, so this is applied while walking the
+                            ranked list — i.e. BEFORE the top_k cut, so a model
+                            filter never leaves fewer than top_k results when
+                            enough matching chunks exist.
 
         Returns:
             List of result dicts with chunk data + V2 fields
         """
+        if isinstance(vehicle_models, str):
+            vehicle_models = [vehicle_models]
+        allowed = {m for m in (vehicle_models or []) if m}
+
         query_tokens = self._tokenise(query)
 
         if not query_tokens:
@@ -149,8 +158,8 @@ class BM25Searcher:
             chunk_id = self.chunk_ids[idx]
             meta     = self.metadatas[idx]
 
-            # Post-filter by vehicle_model
-            if vehicle_model and meta.get("vehicle_model") != vehicle_model:
+            # Model scope (see docstring: applied before the top_k cut)
+            if allowed and meta.get("vehicle_model") not in allowed:
                 continue
 
             # Deduplicate (component boost can cause duplicates)
@@ -196,10 +205,10 @@ def get_bm25_searcher() -> BM25Searcher:
 def bm25_search(
     query: str,
     top_k: int = 10,
-    vehicle_model: str | None = None
+    vehicle_models: "Sequence[str] | str | None" = None
 ) -> list[dict]:
     """Convenience function — uses the module-level singleton."""
-    return get_bm25_searcher().search(query, top_k, vehicle_model)
+    return get_bm25_searcher().search(query, top_k, vehicle_models)
 
 
 # ── Quick test ───────────────────────────────────────────────────────────────

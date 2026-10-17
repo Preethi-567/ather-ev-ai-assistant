@@ -32,9 +32,11 @@ from src.db.feedback_store        import init_db, log_query, update_rating, get_
 from src.query.intent_classifier  import classify_intent, intent_to_content_filter
 from src.query.query_rewriter     import rewrite_query
 from src.query.memory             import get_memory
-from src.retrieval.hybrid_search  import get_hybrid_searcher, hybrid_search
+from src.query.model_detector     import resolve_scope, SERIES_GROUPS
+from src.retrieval.hybrid_search  import get_hybrid_searcher, hybrid_search_grouped
 from src.generation.prompt_chain  import get_prompt_chain
 from src.generation.prompts       import OUT_OF_SCOPE_RESPONSE
+from src.support_contacts         import resolve_support_contact
 
 
 # ── Lifespan: startup + shutdown ──────────────────────────────────────────────
@@ -102,16 +104,36 @@ class ChunkMetadata(BaseModel):
     source_file:  str | None  = None
 
 
+class SourceRef(BaseModel):
+    """A verified citation: this model's manual, this page."""
+    model:       str
+    page:        int
+    source_file: str
+
+
 class QueryResponse(BaseModel):
     answer:         str
     intent:         str
     rewritten_query: str
-    cited_pages:    list[int]
+    cited_pages:    list[int]   # kept for older clients; prefer `sources`
+    sources:        list[SourceRef] = Field(default_factory=list)
     fallback_used:  bool
     low_confidence: bool
     latency_ms:     int
     session_id:     str
     row_id:         int         # use this to submit feedback
+
+    # Which scooter(s) retrieval was scoped to, and how that was decided:
+    #   explicit → named in this query · session → inherited from earlier turn
+    #   none     → not named; both series were searched
+    models:         list[str] = Field(default_factory=list)
+    model_scope:    str       = "none"
+
+    # Verified phone number from the manual — SEPARATE from the fixed fallback
+    # sentence, and None unless every scooter in play has a number printed in
+    # its own manual (currently 450X and 450S only). Never inferred.
+    support_contact:        str | None = None
+    support_contact_source: str | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -156,10 +178,18 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
       1. Assign session_id if not provided
       2. Classify intent → skip RAG if out_of_scope
       3. Rewrite query for retrieval
-      4. Hybrid search (dense + BM25 + reranker)
-      5. 3-step generation (sufficiency → generate → validate)
-      6. Log to SQLite
-      7. Return response
+      4. Resolve scooter model scope (explicit → session → both series)
+      5. Hybrid search per scope group (dense + BM25 + reranker), merged
+      6. 3-step generation (sufficiency → generate → render citations)
+      7. Log to SQLite
+      8. Return response
+
+    RACE / THROUGHPUT NOTE: this is `async def` but every call inside it
+    (Gemini, cross-encoder, Chroma) is blocking, so the event loop runs one
+    request at a time. That is why ConversationMemory (a plain dict, no lock) has
+    not shown races. The moment this becomes `def` (threadpool) or gains workers,
+    two requests on one session_id can interleave in memory.add_turn/get_context.
+    The model-scope store is already lock-protected; memory is not (P3).
     """
     request_start = time.time()
 
@@ -209,9 +239,21 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
 
     logger.info(f"[{session_id}] Rewritten: '{rewritten[:80]}'")
 
-    # ── Step 4: Hybrid retrieval ──────────────────────────────────────────
-    retrieval_result = hybrid_search(
+    # ── Step 4: Which scooter(s)? ─────────────────────────────────────────
+    # Original text first (what the user typed), rewritten text second (it
+    # resolves "what about the Z model?"), then the session's last model.
+    scope = resolve_scope(query, rewritten, session_id)
+    groups = [list(g) for g in scope.groups] or SERIES_GROUPS
+
+    logger.info(
+        f"[{session_id}] Scope: {scope.source} → "
+        f"{[list(g) for g in groups]}"
+    )
+
+    # ── Step 5: Hybrid retrieval (one search per group, merged) ───────────
+    retrieval_result = hybrid_search_grouped(
         query               = rewritten,
+        groups              = groups,
         content_type_filter = content_filter,
     )
 
@@ -225,7 +267,16 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
 
     total_latency = int((time.time() - request_start) * 1000)
 
-    # ── Step 6: Log to SQLite ─────────────────────────────────────────────
+    # Models the answer is actually about: the named scope if there is one,
+    # otherwise whichever scooters survived into the retrieved chunks.
+    chunk_models = {
+        c.get("metadata", {}).get("vehicle_model")
+        for c in retrieval_result.get("chunks", [])
+    }
+    answer_models = scope.models or sorted(m for m in chunk_models if m)
+    contact       = resolve_support_contact(answer_models)
+
+    # ── Step 7: Log to SQLite ─────────────────────────────────────────────
     row_id = log_query(
         session_id  = session_id,
         query       = query,
@@ -243,17 +294,27 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
         f"latency={total_latency}ms | row_id={row_id}"
     )
 
-    # ── Step 7: Return ────────────────────────────────────────────────────
+    # ── Step 8: Return ────────────────────────────────────────────────────
     return QueryResponse(
         answer          = result["answer"],
         intent          = intent,
         rewritten_query = rewritten,
         cited_pages     = result["cited_pages"],
+        sources         = [
+            SourceRef(model=s.model, page=s.page, source_file=s.source_file)
+            for s in result.get("sources", [])
+        ],
         fallback_used   = result["fallback_used"],
         low_confidence  = result["low_confidence"],
         latency_ms      = total_latency,
         session_id      = session_id,
         row_id          = row_id,
+        models          = answer_models,
+        model_scope     = scope.source,
+        support_contact        = contact.number if contact else None,
+        support_contact_source = (
+            f"{contact.source_file}, page {contact.page}" if contact else None
+        ),
     )
 
 

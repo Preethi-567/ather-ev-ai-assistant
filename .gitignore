@@ -66,3 +66,6 @@ Thumbs.db
 # data/manuals/
 
 # OR keep them if important for demo
+
+# Test caches
+.pytest_cache/

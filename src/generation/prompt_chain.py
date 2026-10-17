@@ -13,14 +13,14 @@ Step 2 — Answer Generation
     Call Gemini at temperature=0.1 for near-deterministic answers.
     Citations are written by the model following Rule 3 in SYSTEM_PROMPT.
 
-Step 3 — Citation Validator
-    Parse every "page X" reference in the generated answer.
-    Cross-check each against the actual page numbers in retrieved chunk metadata.
-    Strip any page number that does not exist in the chunks (hallucinated citation).
+Step 3 — Citation Rendering (deterministic)
+    The model sees chunk TAGS ([C1]..) and the scooter model, never page numbers.
+    It cites by tag; code maps each tag to (model, page) from chunk metadata.
+    A tag with no retrieved chunk behind it is stripped. As a second layer, any
+    free-text "page N" the model writes anyway is removed unless N was retrieved.
     If reranker confidence is low → prepend LOW_CONFIDENCE_PREFIX.
 """
 
-import re
 import time
 from loguru import logger
 
@@ -31,6 +31,10 @@ from src.generation.prompts import (
     GENERATION_PROMPT,
     FALLBACK_RESPONSE,
     LOW_CONFIDENCE_PREFIX,
+)
+from src.generation.citations import (
+    render_citations,
+    strip_invalid_free_text_pages,
 )
 from src.query.memory import ConversationMemory, get_memory
 
@@ -44,27 +48,23 @@ def _build_context_block(chunks: list[dict]) -> str:
     """
     Convert retrieved chunks into the context string for the generation prompt.
 
-    Each chunk block includes:
-      - Chunk number (for the model to reference internally)
-      - Page number and section (for citations)
-      - Content type (warns model what kind of content this is)
-      - Summary (one-line topic — helps model orient quickly)
-      - Component names if present (for diagram pages)
-      - Full text
+    Each block shows the model:
+      - a citation TAG  [C1], [C2], ...   (position in `chunks`; see citations.py)
+      - the scooter MODEL the chunk comes from
+      - section, content type, summary, component names, full text
 
-    Why include summary AND full text?
-    - Summary lets the model quickly scan for relevance
-    - Full text gives it the detail needed to answer precisely
+    Deliberately NOT shown: page number and file name. The model cannot cite or
+    misquote what it cannot see; the page is attached by code after generation.
     """
     blocks = []
 
     for i, chunk in enumerate(chunks, 1):
-        meta          = chunk.get("metadata", {})
-        summary       = chunk.get("summary", "").strip()
+        meta            = chunk.get("metadata", {})
+        summary         = chunk.get("summary", "").strip()
         component_names = chunk.get("component_names", [])
 
-        lines = [f"--- CHUNK {i} ---"]
-        lines.append(f"Page      : {meta.get('page_number', 'N/A')}")
+        lines = [f"--- [C{i}] ---"]
+        lines.append(f"Model     : {meta.get('vehicle_model', 'Unknown')}")
         lines.append(f"Section   : {meta.get('section', 'N/A')}")
         lines.append(f"Type      : {meta.get('content_type', 'general')}")
 
@@ -82,73 +82,24 @@ def _build_context_block(chunks: list[dict]) -> str:
 
 def _build_summaries_block(chunks: list[dict]) -> str:
     """
-    Build a compact summaries-only block for the sufficiency check.
+    Compact summaries-only block for the sufficiency check (Step 1).
 
-    Why summaries instead of full text for Step 1?
-    - Sufficiency check only needs to know IF the topic is covered
-    - Full chunk text wastes tokens on a YES/NO question
-    - Summaries are 1-3 sentences — much cheaper per Gemini call
+    Why summaries instead of full text? The check only needs to know IF the topic
+    is covered; full text wastes tokens on a YES/NO question.
+    Tags and model are included so the check sees the same scope as generation.
     """
     lines = []
     for i, chunk in enumerate(chunks, 1):
         summary = chunk.get("summary", "").strip()
-        page    = chunk.get("metadata", {}).get("page_number", "?")
+        model   = chunk.get("metadata", {}).get("vehicle_model", "Unknown")
 
         # Fall back to first 120 chars of text if no summary
         if not summary:
             summary = chunk["text"][:120].strip()
 
-        lines.append(f"{i}. [Page {page}] {summary}")
+        lines.append(f"{i}. [C{i}] ({model}) {summary}")
 
     return "\n".join(lines)
-
-
-# ── Citation validator ────────────────────────────────────────────────────────
-
-def _extract_page_refs(text: str) -> list[int]:
-    """
-    Extract all page numbers cited in the generated answer.
-    Matches: 'page 12', 'Page 12', '(page 12)', '[page 12]'
-    """
-    matches = re.findall(r'[Pp]age\s+(\d+)', text)
-    return [int(m) for m in matches]
-
-
-def _validate_citations(answer: str, chunks: list[dict]) -> tuple[str, list[int]]:
-    """
-    Step 3: Citation Validator.
-
-    For every page number cited in the answer:
-      - If it exists in chunk metadata → keep it
-      - If it does NOT exist → replace with [unverified] and log a warning
-
-    Returns:
-        (cleaned_answer, list_of_valid_cited_pages)
-    """
-    # Build set of valid page numbers from retrieved chunks
-    valid_pages = set()
-    for chunk in chunks:
-        page = chunk.get("metadata", {}).get("page_number")
-        if page is not None:
-            valid_pages.add(int(page))
-
-    cited_pages      = _extract_page_refs(answer)
-    hallucinated     = [p for p in cited_pages if p not in valid_pages]
-    valid_cited      = [p for p in cited_pages if p in valid_pages]
-
-    if hallucinated:
-        logger.warning(
-            f"Citation validator: hallucinated pages detected: {hallucinated} "
-            f"| valid pages in chunks: {sorted(valid_pages)}"
-        )
-        for page in hallucinated:
-            answer = re.sub(
-                rf'\b[Pp]age\s+{page}\b',
-                '[page reference removed]',
-                answer
-            )
-
-    return answer, valid_cited
 
 
 # ── Main chain ────────────────────────────────────────────────────────────────
@@ -269,7 +220,8 @@ class PromptChain:
             {
               "answer":         str,   final answer to show the user
               "fallback_used":  bool,  True if sufficiency check failed
-              "cited_pages":    list,  verified page numbers cited
+              "cited_pages":    list,  page numbers of verified citations
+              "sources":        list[Source]  verified (model, page, file) citations
               "low_confidence": bool,
               "latency_ms":     int
             }
@@ -293,6 +245,7 @@ class PromptChain:
                 "answer":         FALLBACK_RESPONSE,
                 "fallback_used":  True,
                 "cited_pages":    [],
+                "sources":        [],
                 "low_confidence": True,
                 "latency_ms":     int((time.time() - start_time) * 1000),
             }
@@ -305,6 +258,7 @@ class PromptChain:
                 "answer":         FALLBACK_RESPONSE,
                 "fallback_used":  True,
                 "cited_pages":    [],
+                "sources":        [],
                 "low_confidence": False,
                 "latency_ms":     int((time.time() - start_time) * 1000),
             }
@@ -312,8 +266,20 @@ class PromptChain:
         # ── Step 2: Generate answer ───────────────────────────────────────────
         raw_answer = self._generate_answer(query, chunks, session_id)
 
-        # ── Step 3: Validate citations ────────────────────────────────────────
-        clean_answer, cited_pages = _validate_citations(raw_answer, chunks)
+        # ── Step 3: Render citations ──────────────────────────────────────────
+        # Layer 2 first (on the model's raw text, so our own rendered
+        # "page N" strings are never re-validated), then tags → citations.
+        raw_answer, removed_pages = strip_invalid_free_text_pages(raw_answer, chunks)
+        clean_answer, sources, unknown_tags = render_citations(raw_answer, chunks)
+        cited_pages = sorted({s.page for s in sources})
+
+        if removed_pages:
+            logger.warning(f"Citation layer 2: removed free-text pages {removed_pages}")
+        if unknown_tags:
+            logger.warning(
+                f"Citation render: model used unknown tags {unknown_tags} "
+                f"(retrieved {len(chunks)} chunks) — stripped"
+            )
 
         # ── Apply confidence prefix if needed ─────────────────────────────────
         final_answer = self._apply_confidence_prefix(clean_answer, low_conf)
@@ -327,6 +293,11 @@ class PromptChain:
         # Only update memory if we gave a real answer
         if not is_self_fallback:
             self.memory.add_turn(session_id, query, final_answer)
+            if not sources:
+                # Rule 3 says every answer is cited. Not enforced here (P1 only
+                # reports it); the eval run should count these before we decide
+                # whether to reject uncited answers.
+                logger.warning("Answer has NO verified citation — Rule 3 violated")
 
         latency_ms = int((time.time() - start_time) * 1000)
 
@@ -340,6 +311,7 @@ class PromptChain:
             "answer":         final_answer,
             "fallback_used":  is_self_fallback,
             "cited_pages":    cited_pages,
+            "sources":        sources,
             "low_confidence": low_conf,
             "latency_ms":     latency_ms,
         }
