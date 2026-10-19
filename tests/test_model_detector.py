@@ -5,7 +5,7 @@ import pytest
 
 from src.query.model_detector import (
     M_450S, M_450X, M_RIZTA_S, M_RIZTA_Z,
-    SessionModelStore, detect_models, resolve_scope,
+    SessionModelStore, detect_models, resolve_scope, strip_model_mentions,
 )
 
 
@@ -99,3 +99,34 @@ def test_store_is_safe_under_concurrent_writes():
     threads = [threading.Thread(target=hammer, args=(i,)) for i in range(16)]
     [t.start() for t in threads]; [t.join() for t in threads]
     assert not errors
+
+
+# ── strip_model_mentions: model names removed from RANKING text only ──────────
+
+@pytest.mark.parametrize("text, expected", [
+    ("how do I charge my Rizta Z?",                 "how do I charge my scooter?"),
+    ("what is the tyre pressure on my 450S?",       "what is the tyre pressure on my scooter?"),
+    ("what is the range of the Ather 450X?",        "what is the range of the scooter?"),   # "Ather " consumed
+    ("tyre pressure on the Ather450S",              "tyre pressure on the scooter"),        # glued prefix
+    ("450 Plus top speed",                          "scooter top speed"),
+    ("450X vs Rizta Z boot space",                  "scooter vs scooter boot space"),
+    ("where is the Joey Pocket on the Rizta Z?",    "where is the Joey Pocket on the scooter?"),
+    ("Rizta Zip mode",                              "scooter Zip mode"),                    # Zip stays intact
+    ("how do I reset the dashboard",                "how do I reset the dashboard"),        # nothing to strip
+    ("",                                            ""),
+])
+def test_strip_model_mentions(text, expected):
+    assert strip_model_mentions(text) == expected
+
+
+@pytest.mark.parametrize("text", ["450S", "Ather Rizta Z", "Rizta", "  450x "])
+def test_strip_keeps_original_when_nothing_meaningful_remains(text):
+    """A query that is ONLY a model name must not become the bare word 'scooter'."""
+    assert strip_model_mentions(text) == text
+
+
+def test_strip_is_consistent_with_detection():
+    """After stripping, no model mention may remain detectable."""
+    for text in ["how do I charge my Rizta Z?", "450X vs Rizta Z boot space",
+                 "tyre pressure on the Ather450S", "450+ range"]:
+        assert detect_models(strip_model_mentions(text)) == []

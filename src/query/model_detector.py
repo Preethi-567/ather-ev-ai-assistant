@@ -135,6 +135,58 @@ def detect_models(text: str) -> list[list[str]]:
     return groups
 
 
+# ── Stripping model names out of ranking text ────────────────────────────────
+# Once a query is scoped, the metadata filter has already restricted retrieval
+# to the right scooter(s). Leaving "Rizta Z" in the text that is EMBEDDED and
+# RERANKED then does harm, not good: every candidate is a Rizta Z page, so the
+# name cannot discriminate between them, and it pulls in pages that merely
+# MENTION the name (intro, trademarks, storage) ahead of the page that answers.
+#
+# Measured on the real index (query "how do I charge my Rizta Z?"):
+#     with the name     → plugging-in page ranked outside the top 5
+#     name → "scooter"  → plugging-in page ranked #1
+# The same change moved "tyre pressure on my 450S" from rank 2 to rank 1 and
+# turned its top reranker score from -4.9 to +3.1.
+#
+# An optional glued/spaced "Ather" prefix is consumed too, so "Ather450S" and
+# "Ather Rizta Z" become "scooter", not "Atherscooter" / "Ather scooter".
+_STRIP_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"(?:\bather\s*)?" + p.pattern, p.flags) for p, _ in _PATTERNS
+]
+_NEUTRAL_WORD = "scooter"
+
+
+def strip_model_mentions(text: str) -> str:
+    """
+    Replace every scooter-model mention with the neutral word "scooter".
+
+    Meant for the text used to RANK candidates (dense query, BM25 query,
+    reranker query) after the scope has been resolved. It must never be used
+    for scope detection and never for the question shown to the generator:
+    the generator keeps the user's own wording.
+
+    Safety net: if nothing meaningful is left once the model name is removed
+    (the whole query was just "450S"), the original text is returned.
+
+    >>> strip_model_mentions("how do I charge my Rizta Z?")
+    'how do I charge my scooter?'
+    >>> strip_model_mentions("tyre pressure on the Ather450S")
+    'tyre pressure on the scooter'
+    """
+    if not text:
+        return text
+
+    out = text
+    for pattern in _STRIP_PATTERNS:
+        out = pattern.sub(_NEUTRAL_WORD, out)
+    out = re.sub(r"\s{2,}", " ", out).strip()
+
+    leftover = out.replace(_NEUTRAL_WORD, " ")
+    if not re.search(r"[A-Za-z]{2,}", leftover):
+        return text
+    return out
+
+
 # ── Session stickiness ────────────────────────────────────────────────────────
 @dataclass
 class SessionModelStore:

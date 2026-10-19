@@ -17,6 +17,7 @@ from sentence_transformers import CrossEncoder
 from src.retrieval.dense_search import dense_search
 from src.retrieval.bm25_search  import bm25_search
 from src.retrieval.group_merge  import merge_group_results
+from src.query.model_detector   import strip_model_mentions
 
 # ── Constants ────────────────────────────────────────────────────────────────
 RERANKER_MODEL   = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -37,6 +38,10 @@ CONFIDENCE_FLOOR = 0.0      # below this → prepend uncertainty warning
 GROUP_MIN_RERANK    = 0.0
 MAX_CONTEXT_CHUNKS  = 6     # total chunks sent to the generator across groups
 MIN_PER_GROUP       = 2
+
+# Characters of chunk text shown to the cross-encoder. The model truncates at
+# max_length=512 tokens anyway; this only bounds the work for very long chunks.
+RERANK_DOC_CHARS    = 1500
 
 
 class HybridSearcher:
@@ -107,29 +112,20 @@ class HybridSearcher:
 
     def _build_reranker_input(self, query: str, chunk: dict) -> str:
         """
-        Build the text fed to the cross-encoder for reranking.
+        Text fed to the cross-encoder for one candidate: the chunk text itself.
 
-        V2 upgrade: we prepend the summary and any component names.
-        The cross-encoder sees a richer document representation:
-          [summary] | [component names] | [full text]
-        This helps it score component-page chunks more accurately
-        when the query mentions a specific part.
+        HISTORY: V2 prepended `summary | components | text` and cut it at 400
+        characters. On this corpus that was harmful:
+          - the summary is the start of the text, so the first ~170 characters
+            were shown twice and the 400-character cut then removed the tail;
+          - "components" are sentence fragments ("Plug in the 3-pin connector
+            of the charging"), i.e. noise.
+        Measured on the real index, dropping both (and the model name from the
+        query, see strip_model_mentions) took the best charging page from
+        outside the top 5 to #1 and lifted good-match scores from about -3..-5
+        to +5..+8. The `query` argument is kept so the signature is stable.
         """
-        parts = []
-
-        summary = chunk.get("summary", "").strip()
-        if summary:
-            parts.append(summary)
-
-        component_names = chunk.get("component_names", [])
-        if component_names:
-            parts.append("Components: " + ", ".join(component_names))
-
-        parts.append(chunk["text"])
-
-        # Truncate to 400 chars — cross-encoder has max_length=512 tokens
-        doc_text = " | ".join(parts)[:400]
-        return doc_text
+        return chunk["text"][:RERANK_DOC_CHARS]
 
     def search(
         self,
@@ -154,14 +150,21 @@ class HybridSearcher:
         """
         logger.info(f"Hybrid search: '{query[:70]}'")
 
+        # When a scope is set, the metadata filter already pins the scooter, so
+        # the model name is removed from the text used to RANK (dense query,
+        # BM25 query, reranker). The generator still gets the user's wording.
+        ranking_query = strip_model_mentions(query) if vehicle_models else query
+        if ranking_query != query:
+            logger.debug(f"Ranking query: '{query[:70]}' → '{ranking_query[:70]}'")
+
         # ── Step 1: Parallel retrieval ────────────────────────────────────────
         dense_results = dense_search(
-            query, top_k=DENSE_TOP_K,
+            ranking_query, top_k=DENSE_TOP_K,
             vehicle_models=vehicle_models,
             content_type_filter=content_type_filter
         )
         bm25_results = bm25_search(
-            query, top_k=BM25_TOP_K,
+            ranking_query, top_k=BM25_TOP_K,
             vehicle_models=vehicle_models
         )
 
@@ -179,7 +182,7 @@ class HybridSearcher:
         # ── Step 3: Cross-encoder Reranking ──────────────────────────────────
         # Build (query, document) pairs for the cross-encoder
         reranker_inputs = [
-            (query, self._build_reranker_input(query, chunk))
+            (ranking_query, self._build_reranker_input(ranking_query, chunk))
             for chunk in fused_candidates
         ]
 
@@ -215,6 +218,7 @@ class HybridSearcher:
             "chunks":         top_results,
             "top_score":      round(top_score, 4),
             "low_confidence": low_conf,
+            "ranking_query":  ranking_query,
         }
 
 

@@ -213,3 +213,67 @@ def test_series_fallback_keeps_both_series_when_both_relevant(hybrid):
     assert models_of(out["chunks"]) & {"Ather 450X", "Ather 450S"}
     assert models_of(out["chunks"]) & {"Ather Rizta S", "Ather Rizta Z"}
     assert out["groups_searched"] == 2
+
+
+# ── ranking text: model name removed once the scope is pinned ────────────────
+
+@pytest.fixture()
+def recording(monkeypatch):
+    """Records the query each ranker receives and the (query, doc) pairs the
+    reranker scores."""
+    seen = {"dense": [], "bm25": [], "pairs": []}
+    chunk = {"chunk_id": "c1", "text": "Plug in the charging cable into a 5A socket",
+             "score": 0.5, "source": "dense",
+             "metadata": {"vehicle_model": "Ather Rizta Z", "page_number": 35, "content_type": "procedure"},
+             "summary": "SUMMARY-SHOULD-NOT-BE-SCORED", "keywords": [],
+             "component_names": ["COMPONENT-SHOULD-NOT-BE-SCORED"]}
+
+    def fake_dense(query, top_k=10, vehicle_models=None, content_type_filter=None):
+        seen["dense"].append(query)
+        return [dict(chunk)]
+
+    def fake_bm25(query, top_k=10, vehicle_models=None):
+        seen["bm25"].append(query)
+        return []
+
+    class RecordingReranker:
+        def predict(self, pairs):
+            seen["pairs"].extend(pairs)
+            return np.array([1.0] * len(pairs))
+
+    monkeypatch.setattr(hs, "dense_search", fake_dense)
+    monkeypatch.setattr(hs, "bm25_search", fake_bm25)
+    s = hs.HybridSearcher.__new__(hs.HybridSearcher)
+    s.reranker = RecordingReranker()
+    s.seen = seen
+    return s
+
+
+def test_scoped_search_ranks_on_text_without_the_model_name(recording):
+    out = recording.search("how do I charge my Rizta Z?", ["Ather Rizta Z"])
+    want = "how do I charge my scooter?"
+    assert recording.seen["dense"] == [want]
+    assert recording.seen["bm25"] == [want]
+    assert [q for q, _ in recording.seen["pairs"]] == [want]
+    assert out["ranking_query"] == want
+
+
+def test_unscoped_search_leaves_the_query_alone(recording):
+    """No scope → nothing was filtered by metadata, so nothing may be stripped."""
+    q = "how do I charge my Rizta Z?"
+    recording.search(q, None)
+    assert recording.seen["dense"] == [q]
+
+
+def test_reranker_sees_chunk_text_only(recording):
+    """Not summary, not component fragments, and the full text rather than 400 chars."""
+    recording.search("how do I charge my Rizta Z?", ["Ather Rizta Z"])
+    (_, doc), = recording.seen["pairs"]
+    assert doc == "Plug in the charging cable into a 5A socket"
+    assert "SHOULD-NOT-BE-SCORED" not in doc
+
+
+def test_long_chunk_is_bounded_not_cut_at_400(recording):
+    chunk = {"text": "word " * 1000}
+    doc = recording._build_reranker_input("q", chunk)
+    assert len(doc) == hs.RERANK_DOC_CHARS and hs.RERANK_DOC_CHARS > 400
