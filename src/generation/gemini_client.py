@@ -19,6 +19,8 @@ load_dotenv()
 
 # ── Working models confirmed on your account ──────────────────────────────────
 MODEL_FALLBACK_CHAIN = [
+    "gemini-3.1-flash-lite",     # primary: stable (non-preview), ~1 s per call
+    "gemini-3.5-flash-lite",     # fallback: fastest in the probe, ~1.2 s per call
     "gemini-3.1-flash-lite-preview"   # best for short queries, but often unavailable
 ]
 
