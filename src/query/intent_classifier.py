@@ -121,6 +121,22 @@ def _gemini_classify(query: str) -> str:
     return "spec_lookup"
 
 
+def classify_by_keywords(query: str) -> dict | None:
+    """
+    Keyword-only classification, zero API cost.
+    Returns the same shape as classify_intent, or None when no keyword matched
+    (the caller then decides how to spend a Gemini call).
+    """
+    query = query.strip()
+    if not query:
+        return {"intent": "out_of_scope", "method": "empty", "skip_rag": True}
+    intent = _keyword_classify(query)
+    if intent is None:
+        return None
+    logger.info(f"Intent: '{query[:60]}' → {intent} (via keyword)")
+    return {"intent": intent, "method": "keyword", "skip_rag": intent == "out_of_scope"}
+
+
 def classify_intent(query: str) -> dict:
     """
     Classify user query intent.

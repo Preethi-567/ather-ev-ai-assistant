@@ -21,6 +21,7 @@ Step 3 — Citation Rendering (deterministic)
     If reranker confidence is low → prepend LOW_CONFIDENCE_PREFIX.
 """
 
+import os
 import time
 from loguru import logger
 
@@ -40,6 +41,34 @@ from src.query.memory import ConversationMemory, get_memory
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 CONFIDENCE_FLOOR = 0.4     # reranker score below this → prepend low-confidence warning
+
+# ── Fast reject: no Gemini call at all when nothing in the manual matches ─────
+# Reranker scores are raw cross-encoder logits. Measured on the real index after
+# the ranking fix (ADR-003), best-chunk score per question:
+#
+#     answerable questions      +3.6 .. +8.9   (7 of 7)
+#     clearly absent topics     -6.4 .. -5.7   (sunroof, dashcam, price)
+#     absent but on-topic       +2.1 and +4.9  (motor replacement, charge TIME)
+#
+# Off-topic questions land far below every answerable one, so a floor in the
+# empty gap rejects them without spending two Gemini calls. On-topic questions
+# the manual does not answer (charge TIME) score like answerable ones: retrieval
+# cannot tell them apart, and the grounded generator (Rule 2) is what refuses
+# those. The floor is set LOW on purpose: a wrongly rejected real question is
+# worse than one extra Gemini call.
+# Re-calibrate on the P5 evaluation set; P3 moves scores to a 0-1 scale.
+NO_MATCH_FLOOR = -3.0
+
+# ── Sufficiency check switch ──────────────────────────────────────────────────
+# Step 1 asks Gemini YES/NO over chunk SUMMARIES. In the logged runs it answered
+# YES every time, including for the question the generator then correctly
+# refused, so it cost a call and ~7 s without changing an outcome. It stays ON by
+# default (it is part of the specified 3-step chain); switch it off with
+#     ATHER_SUFFICIENCY_CHECK=0
+# to measure the difference on the evaluation set before deciding.
+SUFFICIENCY_CHECK_ENABLED = (
+    os.getenv("ATHER_SUFFICIENCY_CHECK", "1").strip().lower() not in {"0", "false", "off", "no"}
+)
 
 
 # ── Context builder ───────────────────────────────────────────────────────────
@@ -250,8 +279,26 @@ class PromptChain:
                 "latency_ms":     int((time.time() - start_time) * 1000),
             }
 
+        # ── Fast reject: nothing in the manual matches at all ─────────────────
+        if top_score < NO_MATCH_FLOOR:
+            logger.info(
+                f"Fast reject: top reranker score {top_score:.2f} < {NO_MATCH_FLOOR} "
+                f"— fallback without calling Gemini"
+            )
+            return {
+                "answer":         FALLBACK_RESPONSE,
+                "fallback_used":  True,
+                "cited_pages":    [],
+                "sources":        [],
+                "low_confidence": True,
+                "latency_ms":     int((time.time() - start_time) * 1000),
+            }
+
         # ── Step 1: Sufficiency check ─────────────────────────────────────────
-        can_answer = self._check_sufficiency(query, chunks)
+        if SUFFICIENCY_CHECK_ENABLED:
+            can_answer = self._check_sufficiency(query, chunks)
+        else:
+            can_answer = True
 
         if not can_answer:
             return {

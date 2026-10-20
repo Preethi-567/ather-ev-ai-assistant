@@ -164,6 +164,34 @@ def _gemini_rewrite(query: str, previous_query: str | None) -> str:
     return rewritten
 
 
+def plan_rewrite(query: str) -> tuple[str, str | None]:
+    """
+    Decide HOW a query would be rewritten, without calling Gemini.
+
+    Returns (method, text):
+        ("fast", "<canned rewrite>")   instant lookup, zero API cost
+        ("gemini", None)               needs a Gemini rewrite
+        ("passthrough", None)          already clear, keep as typed
+
+    Exposed so the query analyser can tell, before spending any call, whether a
+    rewrite call is coming and can fold the intent label into it.
+    """
+    query = query.strip()
+    if not query:
+        return "passthrough", None
+
+    fast = _fast_rewrite(query)
+    if fast:
+        return "fast", fast
+
+    needs_rewriting = (
+        len(query.split()) <= 6
+        or _is_followup_query(query)
+        or query[-1] not in ".?"
+    )
+    return ("gemini", None) if needs_rewriting else ("passthrough", None)
+
+
 def rewrite_query(query: str, previous_query: str | None = None) -> dict:
     """
     Rewrite a user query for better retrieval.
@@ -178,26 +206,15 @@ def rewrite_query(query: str, previous_query: str | None = None) -> dict:
     """
     query = query.strip()
 
-    # Layer 1: instant fast lookup
-    fast = _fast_rewrite(query)
-    if fast:
+    # Layers 1 and 2: see plan_rewrite
+    method, fast = plan_rewrite(query)
+    if method == "fast":
         return {"original": query, "rewritten": fast, "method": "fast", "changed": True}
 
-    # Layer 2: decide if rewriting is needed
-    query_words     = len(query.split())
-    is_followup     = _is_followup_query(query)
-    needs_rewriting = (
-        query_words <= 6
-        or is_followup
-        or query[-1] not in ".?"
-    )
-
-    if needs_rewriting:
+    if method == "gemini":
         rewritten = _gemini_rewrite(query, previous_query)
-        method    = "gemini"
     else:
         rewritten = query
-        method    = "passthrough"
         logger.debug(f"Passthrough: '{query[:60]}'")
 
     return {

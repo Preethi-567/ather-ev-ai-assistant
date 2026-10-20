@@ -46,12 +46,13 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(feedback_store, "DB_PATH", str(tmp_path / "fb.db"))
     feedback_store.init_db()
 
-    state = {"groups": None, "gemini_prompts": [], "generation": "ok [C1]", "sufficient": "YES"}
+    state = {"groups": None, "gemini_prompts": [], "generation": "ok [C1]", "sufficient": "YES",
+             "top_score": 6.0}
 
     def fake_search(query, groups, content_type_filter=None):
         state["groups"] = [list(g) for g in groups]
         chunks = [CHUNKS[m] for g in groups for m in g if m in CHUNKS][:6]
-        return {"chunks": chunks, "top_score": 6.0, "low_confidence": False}
+        return {"chunks": chunks, "top_score": state["top_score"], "low_confidence": False}
 
     def fake_gemini(prompt, temperature=0.1, max_output_tokens=800, **kw):
         state["gemini_prompts"].append(prompt)
@@ -61,10 +62,15 @@ def api(tmp_path, monkeypatch):
 
     monkeypatch.setattr(main, "hybrid_search_grouped", fake_search)
     monkeypatch.setattr(prompt_chain, "call_gemini", fake_gemini)
-    # No rewriter call: pass the query straight through.
-    monkeypatch.setattr(main, "rewrite_query", lambda q, previous_query=None: {"rewritten": q})
-    monkeypatch.setattr(main, "classify_intent",
-                        lambda q: {"intent": "spec_lookup", "method": "test", "skip_rag": False})
+    # No query-analysis Gemini calls: intent fixed, query passed straight through.
+    # (Tests that need the real analyser restore it; see test_out_of_scope_*.)
+    monkeypatch.setattr(
+        main, "analyze_query",
+        lambda q, previous_query=None: (
+            {"intent": "spec_lookup", "method": "test", "skip_rag": False},
+            {"original": q, "rewritten": q, "method": "test", "changed": False},
+        ),
+    )
 
     client = TestClient(main.app)          # no `with`: lifespan (model loading) is not run
     client.state = state
@@ -185,3 +191,40 @@ def test_model_written_fallback_is_still_detected(api):
     api.state["generation"] = FALLBACK_RESPONSE
     body = ask(api, "tyre pressure 450S")
     assert body["fallback_used"] is True and body["sources"] == []
+
+
+# ── latency / quota gates ─────────────────────────────────────────────────────
+
+def test_clear_non_match_is_rejected_without_any_gemini_call(api):
+    """Score far below every answerable question → exact fallback, zero calls."""
+    api.state["top_score"] = -6.0
+    body = ask(api, "does the 450S have a sunroof?")
+    assert body["answer"] == FALLBACK_RESPONSE and body["fallback_used"] is True
+    assert api.state["gemini_prompts"] == []                 # no sufficiency, no generation
+    assert body["support_contact"] == "+91 7676 811 777"     # contact logic is unaffected
+    assert body["sources"] == [] and body["low_confidence"] is True
+
+
+def test_on_topic_score_still_reaches_the_generator(api):
+    api.state["top_score"] = 4.9                              # e.g. "how long to charge" (absent but on-topic)
+    api.state["generation"] = FALLBACK_RESPONSE               # the grounded generator refuses it
+    body = ask(api, "how long does it take to charge my Rizta Z?")
+    assert body["fallback_used"] is True
+    assert len(api.state["gemini_prompts"]) == 2              # sufficiency + generation
+
+
+def test_sufficiency_check_can_be_switched_off(api, monkeypatch):
+    monkeypatch.setattr(prompt_chain, "SUFFICIENCY_CHECK_ENABLED", False)
+    api.state["generation"] = "30 PSI [C1]"
+    body = ask(api, "tyre pressure 450S")
+    assert len(api.state["gemini_prompts"]) == 1              # generation only
+    assert body["sources"][0]["page"] == 20
+
+
+def test_out_of_scope_skips_retrieval_and_costs_no_gemini_call(api, monkeypatch):
+    from src.query.query_analyzer import analyze_query as real_analyze
+    monkeypatch.setattr(main, "analyze_query", real_analyze)  # real keyword path, no network
+    body = ask(api, "who won the IPL?")
+    assert body["intent"] == "out_of_scope" and body["fallback_used"] is True
+    assert api.state["groups"] is None                        # retrieval never ran
+    assert api.state["gemini_prompts"] == [] and body["gemini_calls"] == 0

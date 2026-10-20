@@ -29,12 +29,13 @@ from pydantic import BaseModel, Field
 
 # ── Internal modules ──────────────────────────────────────────────────────────
 from src.db.feedback_store        import init_db, log_query, update_rating, get_analytics
-from src.query.intent_classifier  import classify_intent, intent_to_content_filter
-from src.query.query_rewriter     import rewrite_query
+from src.query.intent_classifier  import intent_to_content_filter
+from src.query.query_analyzer     import analyze_query
 from src.query.memory             import get_memory
 from src.query.model_detector     import resolve_scope, SERIES_GROUPS
 from src.retrieval.hybrid_search  import get_hybrid_searcher, hybrid_search_grouped
 from src.generation.prompt_chain  import get_prompt_chain
+from src.generation.gemini_client import gemini_calls_made
 from src.generation.prompts       import OUT_OF_SCOPE_RESPONSE
 from src.support_contacts         import resolve_support_contact
 
@@ -123,6 +124,10 @@ class QueryResponse(BaseModel):
     session_id:     str
     row_id:         int         # use this to submit feedback
 
+    # Gemini attempts this request cost (retries included). Each one is a unit of
+    # free-tier quota, so this is the number to watch when tuning.
+    gemini_calls:   int = 0
+
     # Which scooter(s) retrieval was scoped to, and how that was decided:
     #   explicit → named in this query · session → inherited from earlier turn
     #   none     → not named; both series were searched
@@ -192,6 +197,7 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
     The model-scope store is already lock-protected; memory is not (P3).
     """
     request_start = time.time()
+    calls_before  = gemini_calls_made()
 
     # ── Session ID ────────────────────────────────────────────────────────
     session_id = request.session_id.strip() or str(uuid.uuid4())
@@ -199,8 +205,12 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
 
     logger.info(f"[{session_id}] Query: '{query[:80]}'")
 
-    # ── Step 1: Intent classification ─────────────────────────────────────
-    intent_result  = classify_intent(query)
+    # ── Step 1: Intent + rewrite, with the fewest Gemini calls ────────────
+    # (0-1 calls; see query_analyzer.py. rewrite_result is None when the query
+    # is out of scope, because there is nothing to retrieve.)
+    memory         = get_memory()
+    previous_query = memory.get_last_query(session_id)
+    intent_result, rewrite_result = analyze_query(query, previous_query=previous_query)
     intent         = intent_result["intent"]
     content_filter = intent_to_content_filter(intent)
 
@@ -227,14 +237,12 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
             fallback_used   = True,
             low_confidence  = False,
             latency_ms      = int((time.time() - request_start) * 1000),
+            gemini_calls    = gemini_calls_made() - calls_before,
             session_id      = session_id,
             row_id          = row_id,
         )
 
-    # ── Step 3: Query rewriting ───────────────────────────────────────────
-    memory         = get_memory()
-    previous_query = memory.get_last_query(session_id)
-    rewrite_result = rewrite_query(query, previous_query=previous_query)
+    # ── Step 3: Rewritten query (already produced in step 1) ──────────────
     rewritten      = rewrite_result["rewritten"]
 
     logger.info(f"[{session_id}] Rewritten: '{rewritten[:80]}'")
@@ -266,6 +274,7 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
     )
 
     total_latency = int((time.time() - request_start) * 1000)
+    gemini_calls  = gemini_calls_made() - calls_before
 
     # Models the answer is actually about: the named scope if there is one,
     # otherwise whichever scooters survived into the retrieved chunks.
@@ -291,6 +300,7 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
     logger.info(
         f"[{session_id}] Done | intent={intent} | "
         f"fallback={result['fallback_used']} | "
+        f"gemini_calls={gemini_calls} | "
         f"latency={total_latency}ms | row_id={row_id}"
     )
 
@@ -307,6 +317,7 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
         fallback_used   = result["fallback_used"],
         low_confidence  = result["low_confidence"],
         latency_ms      = total_latency,
+        gemini_calls    = gemini_calls,
         session_id      = session_id,
         row_id          = row_id,
         models          = answer_models,

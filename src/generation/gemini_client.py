@@ -15,6 +15,8 @@ from google.genai import types
 from dotenv import load_dotenv
 from loguru import logger
 
+from src.generation.rate_limiter import SlidingWindowLimiter, max_calls_from_env
+
 load_dotenv()
 
 # ── Working models confirmed on your account ──────────────────────────────────
@@ -31,7 +33,6 @@ MAX_RETRIES          = 3
 # ── State ─────────────────────────────────────────────────────────────────────
 _client:       genai.Client | None = None
 _active_model: str | None          = None
-_last_call_ts: float               = 0.0
 
 
 def get_client() -> genai.Client:
@@ -113,13 +114,25 @@ def _parse_retry_delay(error_message: str) -> float:
     return MIN_CALL_GAP_SECONDS
 
 
-def _rate_limit_wait():
-    global _last_call_ts
-    elapsed = time.time() - _last_call_ts
-    if elapsed < MIN_CALL_GAP_SECONDS:
-        wait = MIN_CALL_GAP_SECONDS - elapsed
-        logger.debug(f"Rate limit: waiting {wait:.1f}s")
-        time.sleep(wait)
+# Sliding window (see rate_limiter.py): a burst is fine, the Nth+1 call in any
+# 60 s waits. N = GEMINI_MAX_CALLS_PER_MIN, default 10 (the old 6 s gap's rate).
+_limiter = SlidingWindowLimiter(max_calls_from_env())
+
+
+def _rate_limit_wait() -> None:
+    """Block until the window allows one more call, and count that call."""
+    waited = _limiter.acquire()
+    if waited > 0.05:
+        logger.debug(f"Rate limit: waited {waited:.1f}s for the per-minute window")
+
+
+def gemini_calls_made() -> int:
+    """
+    Gemini attempts since startup (retries after a 429 included, because they
+    consume quota too). Callers take a before/after difference to learn how many
+    calls one request cost.
+    """
+    return _limiter.total_calls
 
 
 def _try_call(
@@ -129,8 +142,10 @@ def _try_call(
     max_output_tokens: int
 ) -> str:
     """Single Gemini call attempt. Raises on any error."""
-    global _last_call_ts
     client = get_client()
+
+    # Every attempt (first try or retry) takes a slot in the window.
+    _rate_limit_wait()
 
     response = client.models.generate_content(
         model=model,
@@ -140,7 +155,6 @@ def _try_call(
             max_output_tokens=max_output_tokens,
         )
     )
-    _last_call_ts = time.time()
 
     text = _extract_text(response)
     logger.debug(f"Model: {model} | extracted length: {len(text)}")
@@ -158,8 +172,6 @@ def call_gemini(
     Returns "" only if every model and every retry fails.
     """
     global _active_model
-
-    _rate_limit_wait()
 
     models_to_try = (
         [_active_model] + [m for m in MODEL_FALLBACK_CHAIN if m != _active_model]
@@ -187,6 +199,12 @@ def call_gemini(
                 if is_not_found:
                     logger.warning(f"Model {model} not found — skipping")
                     break   # try next model immediately
+
+                if is_quota and attempt == 1:
+                    # The 429 body names the exhausted quota (per-minute vs
+                    # per-day, per model). Log it once so the real free-tier
+                    # limit is visible instead of guessed.
+                    logger.warning(f"429 detail from {model}: {error_str[:400]}")
 
                 if (is_quota or is_overload) and attempt < MAX_RETRIES:
                     # For 503, use a fixed backoff since there's no retryDelay in the error
