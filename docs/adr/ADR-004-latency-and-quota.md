@@ -137,3 +137,17 @@ one, and rejected obvious non-matches from a calibrated retrieval score. I set
 the threshold from a 12-question table where the two groups did not overlap,
 and I kept the one check I could not yet justify removing behind a switch to be
 measured on the evaluation set."
+
+## Addendum: cold start (found by the first measurement run)
+
+The first question after every restart took 12.3 s while using a single Gemini
+call. The startup log claimed "Hybrid searcher ready (BGE + cross-encoder +
+ChromaDB + BM25)", but `get_hybrid_searcher()` only builds the cross-encoder; the
+embedder, ChromaDB and the BM25 corpus load lazily inside the first search
+(about 10 s). `warm_up()` now loads all of them at startup and runs one
+throwaway search through the whole path, so that cost is paid before the first
+user. A failed warm-up is logged and the API still starts, so `/health` can report
+the problem instead of the process dying.
+
+Lesson recorded for the measurement protocol: always send one throwaway question
+first, and compare only warm runs.

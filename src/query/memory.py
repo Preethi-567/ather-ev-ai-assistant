@@ -12,10 +12,11 @@ Why only 3 turns?
 Design:
 - Plain Python dict — no database, no Redis, no overhead
 - Session-scoped: each Streamlit session or API call gets its own key
-- Thread-safe for single-process FastAPI (uvicorn default)
+- Thread-safe: one lock guards every read and write (see RACE notes below)
 - Reset by deleting the session key
 """
 
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from loguru import logger
@@ -44,26 +45,42 @@ class ConversationMemory:
         # deque with maxlen automatically evicts oldest turn when full
         self._sessions: dict[str, deque[Turn]] = {}
 
+        # RACE: the endpoint is `async def` with blocking calls inside, so today
+        # requests run one at a time and nothing here can interleave. That is an
+        # accident of the current code, not a guarantee: `def` endpoints, a
+        # threadpool, or two uvicorn workers' threads would run these methods
+        # concurrently. RLock (not Lock) because public methods call each other.
+        self._lock = threading.RLock()
+
     def _get_session(self, session_id: str) -> deque[Turn]:
         """Return the deque for this session, creating it if needed."""
-        if session_id not in self._sessions:
-            self._sessions[session_id] = deque(maxlen=self.max_turns)
-        return self._sessions[session_id]
+        with self._lock:
+            # RACE (check-then-set): two threads both see the key missing, both
+            # build a deque, the second assignment replaces the first, and the
+            # turn the first thread then appends goes into a deque nobody holds
+            # any more. A lost turn, no error. The lock makes check + set one step.
+            if session_id not in self._sessions:
+                self._sessions[session_id] = deque(maxlen=self.max_turns)
+            return self._sessions[session_id]
 
     def add_turn(self, session_id: str, query: str, response: str) -> None:
         """
         Add a completed (query, response) turn to memory.
         If memory is full, the oldest turn is automatically dropped.
         """
-        session = self._get_session(session_id)
-        session.append(Turn(query=query, response=response))
-        logger.debug(
-            f"Memory [{session_id}]: {len(session)}/{self.max_turns} turns stored"
-        )
+        with self._lock:
+            session = self._get_session(session_id)
+            session.append(Turn(query=query, response=response))
+            stored = len(session)
+        logger.debug(f"Memory [{session_id}]: {stored}/{self.max_turns} turns stored")
 
     def get_turns(self, session_id: str) -> list[Turn]:
         """Return all stored turns for this session, oldest first."""
-        return list(self._get_session(session_id))
+        with self._lock:
+            # RACE (iteration): list() walks the deque while another thread's
+            # append() can mutate it -> "RuntimeError: deque mutated during
+            # iteration". Copying under the lock gives a consistent snapshot.
+            return list(self._get_session(session_id))
 
     def get_context(self, session_id: str) -> str:
         """
@@ -105,13 +122,20 @@ class ConversationMemory:
 
     def reset(self, session_id: str) -> None:
         """Clear all memory for a session. Call on new chat start."""
-        if session_id in self._sessions:
-            del self._sessions[session_id]
+        with self._lock:
+            # RACE (check-then-delete): `if k in d: del d[k]` lets another thread
+            # delete the key in between -> KeyError. pop(k, None) is a single
+            # step; it sits under the lock so reset also cannot slip between
+            # add_turn's get-session and append (the turn would be written to a
+            # deque that reset just discarded).
+            existed = self._sessions.pop(session_id, None) is not None
+        if existed:
             logger.debug(f"Memory [{session_id}]: reset")
 
     def session_count(self) -> int:
         """Number of active sessions in memory."""
-        return len(self._sessions)
+        with self._lock:
+            return len(self._sessions)
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────

@@ -14,10 +14,11 @@ from typing import Sequence
 from loguru import logger
 from sentence_transformers import CrossEncoder
 
-from src.retrieval.dense_search import dense_search
-from src.retrieval.bm25_search  import bm25_search
+from src.retrieval.dense_search import dense_search, get_dense_searcher
+from src.retrieval.bm25_search  import bm25_search, get_bm25_searcher
 from src.retrieval.group_merge  import merge_group_results
 from src.query.model_detector   import strip_model_mentions
+from src.retrieval.scoring      import GROUP_MIN_LOGIT, confidence, is_low_confidence
 
 # ── Constants ────────────────────────────────────────────────────────────────
 RERANKER_MODEL   = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -25,17 +26,11 @@ RRF_K            = 60       # RRF constant — higher = smoother rank fusion
 DENSE_TOP_K      = 10       # candidates from dense search
 BM25_TOP_K       = 10       # candidates from BM25 search
 FINAL_TOP_K      = 5        # results after reranking
-# NEW — cross-encoder/ms-marco-MiniLM-L-6-v2 logit scale:
-#   > 3.0  = high confidence (good match)
-#   0 to 3 = moderate confidence
-#   < 0    = poor match (chunks probably not relevant)
-CONFIDENCE_FLOOR = 0.0      # below this → prepend uncertainty warning
+# Confidence thresholds are NOT defined here. They are probabilities in
+# src/config.py and are applied through src/retrieval/scoring.py. Chunks keep the
+# raw cross-encoder logit (`reranker_score`); group merging compares logits.
 
 # ── Multi-scope retrieval (several scooters / both series) ───────────────────
-# Same logit scale as CONFIDENCE_FLOOR. Non-best groups must clear this to
-# contribute chunks (see group_merge.py). When P3 moves to sigmoid scores,
-# re-base this together with CONFIDENCE_FLOOR.
-GROUP_MIN_RERANK    = 0.0
 MAX_CONTEXT_CHUNKS  = 6     # total chunks sent to the generator across groups
 MIN_PER_GROUP       = 2
 
@@ -145,7 +140,7 @@ class HybridSearcher:
             {
               "chunks":     list of top-5 chunk dicts,
               "top_score":  float — reranker score of best chunk,
-              "low_confidence": bool — True if top_score < CONFIDENCE_FLOOR
+              "low_confidence": bool — True if the top score is under config.CONFIDENCE_FLOOR
             }
         """
         logger.info(f"Hybrid search: '{query[:70]}'")
@@ -177,7 +172,7 @@ class HybridSearcher:
 
         if not fused_candidates:
             logger.warning("Hybrid search: no candidates after fusion")
-            return {"chunks": [], "top_score": 0.0, "low_confidence": True}
+            return {"chunks": [], "top_score": 0.0, "confidence": 0.0, "low_confidence": True}
 
         # ── Step 3: Cross-encoder Reranking ──────────────────────────────────
         # Build (query, document) pairs for the cross-encoder
@@ -200,23 +195,24 @@ class HybridSearcher:
 
         top_results  = reranked[:FINAL_TOP_K]
         top_score    = top_results[0]["reranker_score"] if top_results else 0.0
-        low_conf     = top_score < CONFIDENCE_FLOOR
+        low_conf     = is_low_confidence(top_score)
 
         if low_conf:
             logger.warning(
                 f"Low confidence: top reranker score {top_score:.3f} "
-                f"< threshold {CONFIDENCE_FLOOR}"
+                f"(confidence {confidence(top_score):.2f}) is below the floor"
             )
 
         logger.info(
             f"Hybrid search complete: {len(top_results)} final chunks, "
-            f"top score: {top_score:.3f} (logit scale), "
+            f"top score: {top_score:.3f} (logit; confidence {confidence(top_score):.2f}), "
             f"low_confidence: {low_conf}"
 )
 
         return {
             "chunks":         top_results,
-            "top_score":      round(top_score, 4),
+            "top_score":      round(top_score, 4),     # raw logit
+            "confidence":     confidence(top_score),   # 0-1, what the API reports
             "low_confidence": low_conf,
             "ranking_query":  ranking_query,
         }
@@ -256,11 +252,11 @@ class HybridSearcher:
         ]
 
         merged = merge_group_results(
-            per_group_results, per_group=per_group, min_score=GROUP_MIN_RERANK
+            per_group_results, per_group=per_group, min_score=GROUP_MIN_LOGIT
         )
 
         top_score = merged["top_score"]
-        low_conf  = (not merged["chunks"]) or top_score < CONFIDENCE_FLOOR
+        low_conf  = (not merged["chunks"]) or is_low_confidence(top_score)
 
         logger.info(
             f"Grouped search: {len(groups)} groups → {len(merged['chunks'])} chunks "
@@ -270,6 +266,7 @@ class HybridSearcher:
         return {
             "chunks":          merged["chunks"],
             "top_score":       round(top_score, 4),
+            "confidence":      confidence(top_score) if merged["chunks"] else 0.0,
             "low_confidence":  low_conf,
             "groups_searched": len(groups),
         }
@@ -283,6 +280,22 @@ def get_hybrid_searcher() -> HybridSearcher:
     if _searcher is None:
         _searcher = HybridSearcher()
     return _searcher
+
+
+def warm_up() -> None:
+    """
+    Load everything a first question needs, now, instead of during it.
+
+    get_hybrid_searcher() only builds the cross-encoder. The BGE embedder and
+    ChromaDB (DenseSearcher) and the BM25 corpus are created lazily on the first
+    search, which measured about 10 s on the first request after every restart
+    (a single-Gemini-call question took 12.3 s). One throwaway search through the
+    whole path (embed, dense, BM25, fuse, rerank) pays that cost at startup and
+    also warms the models' one-off first-call setup.
+    """
+    get_dense_searcher()
+    get_bm25_searcher()
+    get_hybrid_searcher().search("warm up", None)
 
 
 def hybrid_search(

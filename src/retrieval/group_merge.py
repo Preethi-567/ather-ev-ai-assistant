@@ -21,9 +21,10 @@ POLICY
 4. Duplicate chunk_ids across overlapping groups are kept once (highest score).
 5. Output is ordered by score, so citation tags [C1].. follow relevance.
 
-UNITS: scores are the raw cross-encoder logits used by hybrid_search today.
-If hybrid_search switches to sigmoid output (planned in P3), `min_score` must
-be re-based with it — it lives next to CONFIDENCE_FLOOR for that reason.
+UNITS: scores are raw cross-encoder logits and stay logits (a sigmoid saturates
+near 1.0 and would hide the difference between a good and a great match).
+hybrid_search passes `scoring.GROUP_MIN_LOGIT`, the logit form of
+config.GROUP_MIN_CONFIDENCE, so the threshold itself is set on the 0-1 scale.
 """
 
 from typing import Any

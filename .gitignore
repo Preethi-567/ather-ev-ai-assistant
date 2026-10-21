@@ -27,8 +27,12 @@ data/chunks/
 data/extracted/
 data/*.pkl
 data/*.json
+# ...except the evaluation question set, which is source, not output (P5).
+!data/test_set.json
 
-# If you want to keep sample JSON, comment above and add specific allow rules
+# Runtime SQLite feedback store: written on every query, never committed.
+data/feedback.db
+*.db
 
 # ----------------------
 # 🧠 VECTOR DB (IMPORTANT)
@@ -43,9 +47,10 @@ logs/
 *.log
 
 # ----------------------
-# 🧪 TEST OUTPUTS
+# 🧪 TEST / EVAL OUTPUTS
 # ----------------------
-test_set.json
+accuracy.json
+failed_pages.json
 
 # ----------------------
 # 💻 OS FILES

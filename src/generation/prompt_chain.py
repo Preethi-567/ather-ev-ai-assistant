@@ -19,6 +19,10 @@ Step 3 — Citation Rendering (deterministic)
     A tag with no retrieved chunk behind it is stripped. As a second layer, any
     free-text "page N" the model writes anyway is removed unless N was retrieved.
     If reranker confidence is low → prepend LOW_CONFIDENCE_PREFIX.
+
+Step 4 — Safety notices (deterministic, safety.py)
+    Rule 4 (technician) and Rule 6 (escalation) sentences are appended by code,
+    verbatim, decided from the question. Never on the exact fallback.
 """
 
 import os
@@ -33,14 +37,13 @@ from src.generation.prompts import (
     FALLBACK_RESPONSE,
     LOW_CONFIDENCE_PREFIX,
 )
+from src.generation.safety import append_notices, strip_model_notices
 from src.generation.citations import (
     render_citations,
     strip_invalid_free_text_pages,
 )
 from src.query.memory import ConversationMemory, get_memory
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-CONFIDENCE_FLOOR = 0.4     # reranker score below this → prepend low-confidence warning
+from src.retrieval.scoring import confidence, is_no_match
 
 # ── Fast reject: no Gemini call at all when nothing in the manual matches ─────
 # Reranker scores are raw cross-encoder logits. Measured on the real index after
@@ -56,8 +59,8 @@ CONFIDENCE_FLOOR = 0.4     # reranker score below this → prepend low-confidenc
 # cannot tell them apart, and the grounded generator (Rule 2) is what refuses
 # those. The floor is set LOW on purpose: a wrongly rejected real question is
 # worse than one extra Gemini call.
-# Re-calibrate on the P5 evaluation set; P3 moves scores to a 0-1 scale.
-NO_MATCH_FLOOR = -3.0
+# The threshold is config.NO_MATCH_CONFIDENCE (0.05 = logit -2.94), applied via
+# scoring.is_no_match. Re-calibrate it on the P5 evaluation set.
 
 # ── Sufficiency check switch ──────────────────────────────────────────────────
 # Step 1 asks Gemini YES/NO over chunk SUMMARIES. In the logged runs it answered
@@ -232,7 +235,9 @@ class PromptChain:
         self,
         query: str,
         retrieval_result: dict,
-        session_id: str = "default"
+        session_id: str = "default",
+        intent: str | None = None,
+        original_query: str | None = None,
     ) -> dict:
         """
         Execute the full 3-step generation pipeline.
@@ -244,6 +249,8 @@ class PromptChain:
                               - top_score:      float reranker confidence
                               - low_confidence: bool
             session_id:       For conversation memory
+            intent:           Classified intent; decides which safety notices apply
+            original_query:   What the user typed (the notices look at it too)
 
         Returns:
             {
@@ -252,6 +259,7 @@ class PromptChain:
               "cited_pages":    list,  page numbers of verified citations
               "sources":        list[Source]  verified (model, page, file) citations
               "low_confidence": bool,
+              "notices":        list[str]  safety notices appended by code
               "latency_ms":     int
             }
         """
@@ -276,14 +284,16 @@ class PromptChain:
                 "cited_pages":    [],
                 "sources":        [],
                 "low_confidence": True,
+                "notices":        [],
                 "latency_ms":     int((time.time() - start_time) * 1000),
             }
 
         # ── Fast reject: nothing in the manual matches at all ─────────────────
-        if top_score < NO_MATCH_FLOOR:
+        if is_no_match(top_score):
             logger.info(
-                f"Fast reject: top reranker score {top_score:.2f} < {NO_MATCH_FLOOR} "
-                f"— fallback without calling Gemini"
+                f"Fast reject: top reranker score {top_score:.2f} "
+                f"(confidence {confidence(top_score):.3f}) is below the no-match "
+                f"floor — fallback without calling Gemini"
             )
             return {
                 "answer":         FALLBACK_RESPONSE,
@@ -291,6 +301,7 @@ class PromptChain:
                 "cited_pages":    [],
                 "sources":        [],
                 "low_confidence": True,
+                "notices":        [],
                 "latency_ms":     int((time.time() - start_time) * 1000),
             }
 
@@ -307,6 +318,7 @@ class PromptChain:
                 "cited_pages":    [],
                 "sources":        [],
                 "low_confidence": False,
+                "notices":        [],
                 "latency_ms":     int((time.time() - start_time) * 1000),
             }
 
@@ -328,18 +340,35 @@ class PromptChain:
                 f"(retrieved {len(chunks)} chunks) — stripped"
             )
 
-        # ── Apply confidence prefix if needed ─────────────────────────────────
-        final_answer = self._apply_confidence_prefix(clean_answer, low_conf)
+        # ── Notices the model wrote itself are removed first, always ─────────
+        # (so a self-written fallback is exactly the fallback sentence, and a
+        # real answer never carries two copies of a notice).
+        clean_answer = strip_model_notices(clean_answer)
 
         # ── Detect self-generated fallback ────────────────────────────────
         # The model may write the fallback phrase itself when context is
         # insufficient — this counts as a fallback even though generation
         # technically succeeded
-        is_self_fallback = FALLBACK_RESPONSE.strip() in final_answer
+        is_self_fallback = FALLBACK_RESPONSE.strip() in clean_answer
 
-        # Only update memory if we gave a real answer
+        notices: list[str] = []
+        if is_self_fallback:
+            # The fallback sentence must stay exactly as specified: no prefix and
+            # no notices. (If the model wrote text around it, that text is kept
+            # as before; only the added boilerplate is gone.)
+            final_answer = clean_answer
+        else:
+            # Safety notices are appended by code, verbatim (safety.py), then the
+            # uncertainty prefix goes on the front.
+            body, notices = append_notices(
+                clean_answer, intent, original_query, query
+            )
+            final_answer = self._apply_confidence_prefix(body, low_conf)
+
+        # Only update memory if we gave a real answer. Memory keeps the answer
+        # body, not the boilerplate notices.
         if not is_self_fallback:
-            self.memory.add_turn(session_id, query, final_answer)
+            self.memory.add_turn(session_id, query, clean_answer)
             if not sources:
                 # Rule 3 says every answer is cited. Not enforced here (P1 only
                 # reports it); the eval run should count these before we decide
@@ -351,7 +380,7 @@ class PromptChain:
         logger.info(
             f"PromptChain complete | latency={latency_ms}ms | "
             f"cited_pages={cited_pages} |"
-            f"fallback= {is_self_fallback} | low_conf={low_conf}"
+            f"fallback={is_self_fallback} | low_conf={low_conf} | notices={notices}"
         )
 
         return {
@@ -360,6 +389,7 @@ class PromptChain:
             "cited_pages":    cited_pages,
             "sources":        sources,
             "low_confidence": low_conf,
+            "notices":        notices,
             "latency_ms":     latency_ms,
         }
     

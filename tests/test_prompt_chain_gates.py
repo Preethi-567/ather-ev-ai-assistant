@@ -3,7 +3,8 @@
 import pytest
 
 from src.generation import prompt_chain
-from src.generation.prompt_chain import NO_MATCH_FLOOR, PromptChain
+from src.generation.prompt_chain import PromptChain
+from src.retrieval.scoring import NO_MATCH_LOGIT as NO_MATCH_FLOOR
 from src.generation.prompts import FALLBACK_RESPONSE
 
 

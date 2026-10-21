@@ -5,7 +5,7 @@ Version-controlled prompts for the Ather EV Assistant.
 All prompt strings live here — never hardcoded inside logic files.
 To tune behaviour, edit this file only. Logic stays untouched.
 
-Current version: v1.1  (see PROMPT_CHANGELOG at the bottom)
+Current version: v1.2  (see PROMPT_CHANGELOG at the bottom)
 """
 
 # ── Main system prompt ────────────────────────────────────────────────────────
@@ -25,11 +25,9 @@ RULES (non-negotiable — follow every rule on every response):
    If several chunks support a sentence, add all their tags: [C1][C3].
    Use ONLY tags that appear in the context. NEVER write page numbers or manual names yourself — the system turns your tags into the correct citation.
 
-4. SAFETY WARNING: For any answer involving battery, charging, electrical systems, or motor — always append this line at the end:
-   "⚠️ For electrical or battery-related issues, always consult an Ather-certified technician."
+4. NO SAFETY BOILERPLATE: Do NOT write warnings such as "consult a technician" or "if this persists, contact support" yourself. The system appends the required safety and escalation notices after your answer. You may still state a safety instruction that the context itself gives (with its [C#] tag), for example "Do not charge a damaged battery [C2]."
 
-5. ESCALATION: If the query implies something not working, a strange noise, or a safety concern — always end with:
-   "If this persists, please contact Ather Support or book a service appointment via the Ather app."
+5. NO INVENTED CONTACTS: Never invent phone numbers, URLs or addresses. Quote one only if it appears in the context chunks.
 
 6. FORMAT: Use numbered steps for procedures. Use bullet points for lists of features or specifications. Keep language simple and friendly — the user may not be technical.
 
@@ -97,7 +95,8 @@ FALLBACK_RESPONSE = (
 )
 
 # ── Low confidence prefix ─────────────────────────────────────────────────────
-# Prepended when reranker top score < CONFIDENCE_FLOOR.
+# Prepended when the confidence (sigmoid of the top reranker score) is below
+# config.CONFIDENCE_FLOOR.
 
 LOW_CONFIDENCE_PREFIX = (
     "I'm not fully confident in this answer — "
@@ -105,9 +104,12 @@ LOW_CONFIDENCE_PREFIX = (
 )
 
 # ── Prompt version metadata ───────────────────────────────────────────────────
-PROMPT_VERSION = "1.1"
+PROMPT_VERSION = "1.2"
 PROMPT_CHANGELOG = {
     "1.0": "Initial production version — 8 rules, sufficiency check, citation format",
     "1.1": "Citations by chunk tag [C#] rendered in code (model never sees page "
            "numbers); rule 9 per-model answers. Fallback sentence unchanged.",
+    "1.2": "Rules 4/5 no longer ask the model to write the safety warning and the "
+           "escalation line: code appends them verbatim (generation/safety.py), "
+           "using the project-spec wording. Fallback sentence unchanged.",
 }

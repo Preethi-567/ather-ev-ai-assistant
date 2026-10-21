@@ -28,3 +28,25 @@ except ImportError:
     stub.SentenceTransformer = _NoModel
     stub.CrossEncoder = _NoModel
     sys.modules["sentence_transformers"] = stub
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _log_file_in_tmp(tmp_path, monkeypatch):
+    """
+    Tests that run the API lifespan call setup_logging(); keep that file out of the
+    repo's real logs/ folder, and remove the sink afterwards so tests stay isolated.
+    """
+    from loguru import logger
+    from src import logging_setup
+
+    monkeypatch.setattr(logging_setup, "LOG_FILE", tmp_path / "logs" / "ather_assistant.log")
+    monkeypatch.setattr(logging_setup, "_file_sink_id", None)
+    yield
+    if logging_setup._file_sink_id is not None:
+        try:
+            logger.remove(logging_setup._file_sink_id)
+        except ValueError:          # the test already removed its own sink
+            pass

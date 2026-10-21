@@ -228,3 +228,19 @@ def test_out_of_scope_skips_retrieval_and_costs_no_gemini_call(api, monkeypatch)
     assert body["intent"] == "out_of_scope" and body["fallback_used"] is True
     assert api.state["groups"] is None                        # retrieval never ran
     assert api.state["gemini_prompts"] == [] and body["gemini_calls"] == 0
+
+
+# ── P3: safety notices + confidence in the response ───────────────────────────
+
+def test_charging_answer_carries_the_technician_notice_and_lists_it(api):
+    api.state["generation"] = "Plug the charger in [C1]."
+    body = ask(api, "how do I charge my 450S battery?")
+    assert body["answer"].endswith("⚠️ This should only be serviced by an Ather-certified technician.")
+    assert body["notices"] == ["technician"]
+    assert 0.0 <= body["confidence"] <= 1.0
+
+
+def test_plain_spec_answer_has_no_notices(api):
+    api.state["generation"] = "30 PSI [C1]."
+    body = ask(api, "what is the tyre pressure on my 450S?")
+    assert body["notices"] == [] and "serviced by" not in body["answer"]

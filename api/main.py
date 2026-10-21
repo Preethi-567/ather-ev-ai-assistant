@@ -33,11 +33,12 @@ from src.query.intent_classifier  import intent_to_content_filter
 from src.query.query_analyzer     import analyze_query
 from src.query.memory             import get_memory
 from src.query.model_detector     import resolve_scope, SERIES_GROUPS
-from src.retrieval.hybrid_search  import get_hybrid_searcher, hybrid_search_grouped
+from src.retrieval.hybrid_search  import get_hybrid_searcher, hybrid_search_grouped, warm_up
 from src.generation.prompt_chain  import get_prompt_chain
 from src.generation.gemini_client import gemini_calls_made
 from src.generation.prompts       import OUT_OF_SCOPE_RESPONSE
 from src.support_contacts         import resolve_support_contact
+from src.logging_setup            import setup_logging, log_request
 
 
 # ── Lifespan: startup + shutdown ──────────────────────────────────────────────
@@ -47,13 +48,24 @@ async def lifespan(app: FastAPI):
     Runs on startup: load all heavy singletons so the first request
     is not slow. Everything is cached after the first load.
     """
+    # File sink first, so every startup line below lands in logs/ather_assistant.log.
+    # Done here and not at import time so importing this module (tests, tooling)
+    # never creates files.
+    setup_logging()
     logger.info("Ather EV Assistant API starting up...")
 
     init_db()
     logger.info("SQLite feedback DB ready")
 
-    get_hybrid_searcher()
-    logger.info("Hybrid searcher ready (BGE + cross-encoder + ChromaDB + BM25)")
+    # Load BGE + ChromaDB + BM25 + cross-encoder now and run one throwaway
+    # search, so the first user does not wait ~10 s. A failure must not stop the
+    # API from starting: /health can then report it, and the first real query
+    # retries the load and surfaces the real error.
+    try:
+        warm_up()
+        logger.info("Retrieval warmed (BGE + ChromaDB + BM25 + cross-encoder)")
+    except Exception as e:
+        logger.error(f"Retrieval warm-up FAILED — API starting degraded: {e}")
 
     get_prompt_chain()
     logger.info("Prompt chain ready (Gemini client + memory)")
@@ -128,6 +140,14 @@ class QueryResponse(BaseModel):
     # free-tier quota, so this is the number to watch when tuning.
     gemini_calls:   int = 0
 
+    # Top reranker score as a probability (0-1), the number every confidence
+    # threshold in config.py is compared against. Logged per request so P5 can
+    # calibrate the thresholds from real data.
+    confidence:     float = 0.0
+
+    # Safety notices the code appended to the answer ("technician", "escalation").
+    notices:        list[str] = Field(default_factory=list)
+
     # Which scooter(s) retrieval was scoped to, and how that was decided:
     #   explicit → named in this query · session → inherited from earlier turn
     #   none     → not named; both series were searched
@@ -194,7 +214,7 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
     request at a time. That is why ConversationMemory (a plain dict, no lock) has
     not shown races. The moment this becomes `def` (threadpool) or gains workers,
     two requests on one session_id can interleave in memory.add_turn/get_context.
-    The model-scope store is already lock-protected; memory is not (P3).
+    The model-scope store and (since P3) ConversationMemory are lock-protected.
     """
     request_start = time.time()
     calls_before  = gemini_calls_made()
@@ -227,6 +247,14 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
             fallback    = True,
             latency_ms  = int((time.time() - request_start) * 1000),
             cited_pages = [],
+        )
+
+        log_request(
+            query=query, intent=intent, rewritten_query=query,
+            retrieved_pages=[], rerank_score=None, confidence=0.0,
+            latency_ms=int((time.time() - request_start) * 1000),
+            response_length=len(OUT_OF_SCOPE_RESPONSE),
+            gemini_calls=gemini_calls_made() - calls_before, session_id=session_id,
         )
 
         return QueryResponse(
@@ -271,6 +299,8 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
         query            = rewritten,
         retrieval_result = retrieval_result,
         session_id       = session_id,
+        intent           = intent,
+        original_query   = query,
     )
 
     total_latency = int((time.time() - request_start) * 1000)
@@ -297,6 +327,18 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
         cited_pages = result["cited_pages"],
     )
 
+    log_request(
+        query=query, intent=intent, rewritten_query=rewritten,
+        retrieved_pages=[
+            c.get("metadata", {}).get("page_number")
+            for c in retrieval_result.get("chunks", [])
+        ],
+        rerank_score=retrieval_result.get("top_score"),
+        confidence=retrieval_result.get("confidence", 0.0),
+        latency_ms=total_latency, response_length=len(result["answer"]),
+        gemini_calls=gemini_calls, session_id=session_id,
+    )
+
     logger.info(
         f"[{session_id}] Done | intent={intent} | "
         f"fallback={result['fallback_used']} | "
@@ -318,6 +360,8 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
         low_confidence  = result["low_confidence"],
         latency_ms      = total_latency,
         gemini_calls    = gemini_calls,
+        confidence      = retrieval_result.get("confidence", 0.0),
+        notices         = result.get("notices", []),
         session_id      = session_id,
         row_id          = row_id,
         models          = answer_models,
